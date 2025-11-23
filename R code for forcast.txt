@@ -1,0 +1,978 @@
+## Forecast for LH-Group
+install.packages(c("readxl", "dplyr", "tidyr", "lubridate",
+                   "zoo", "forecast", "ggplot2", "Metrics", "openxlsx"))
+
+#############################################
+# 0. Libraries and helper functions
+#############################################
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(zoo)
+library(forecast)
+library(ggplot2)
+library(Metrics)   # for rmse() and mae()
+library(openxlsx)
+
+
+#############################################
+# 1. Load and clean data
+#############################################
+
+file <- "D:/Module/BU7155 mining/groupwork/lh_group_quarterly.xlsx"
+
+# 1.1 Read all columns as text first to safely clean numbers
+df_raw <- read_excel(file, sheet = "lh_group", col_types = "text")
+
+# 1.2 Standardize column names
+df <- df_raw %>%
+  rename_all(~ tolower(gsub("\\s+", "_", .)))
+
+# 1.3 Ensure required columns exist
+required_cols <- c("covid_dummy","period_type","year","quart","adjusted_ebit",
+                   "adjusted_ebit_marge","adjusted_ebitda","ebit","fuel",
+                   "fees_charges","operating_lease_charter","other_material_cost",
+                   "staff_cost","total_revenue")
+
+missing_cols <- setdiff(required_cols, names(df))
+if (length(missing_cols) > 0) {
+  stop("These required columns are missing: ", paste(missing_cols, collapse = ", "))
+}
+
+# 1.4 Basic type cleaning for year/quarter
+df <- df %>%
+  mutate(
+    year  = as.integer(year),
+    quart = toupper(trimws(quart)),
+    quarter_num = case_when(
+      quart %in% c("Q1", "1") ~ 1L,
+      quart %in% c("Q2", "2") ~ 2L,
+      quart %in% c("Q3", "3") ~ 3L,
+      quart %in% c("Q4", "4") ~ 4L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+# 1.5 Create year-quarter index
+df <- df %>%
+  mutate(
+    date_q = as.yearqtr(paste(year, quarter_num), format = "%Y %q")
+  )
+
+# 1.6 Clean numeric columns (incl. covid_dummy)
+num_cols <- c("covid_dummy","adjusted_ebit","adjusted_ebit_marge","adjusted_ebitda",
+              "ebit","fuel","fees_charges","operating_lease_charter",
+              "other_material_cost","staff_cost","total_revenue")
+
+clean_num <- function(x) {
+  x <- gsub("\\(|\\)", "-", x)      # convert (123) to -123 if needed
+  x <- gsub("[^0-9.\\-]", "", x)    # remove all except digits, dot, minus
+  as.numeric(ifelse(x == "", NA, x))
+}
+
+df <- df %>%
+  mutate(across(all_of(num_cols), ~ clean_num(.)))
+
+# 1.7 Create a proper Date column = first day of quarter
+df <- df %>%
+  mutate(
+    month = case_when(
+      quarter_num == 1 ~ 1L,
+      quarter_num == 2 ~ 4L,
+      quarter_num == 3 ~ 7L,
+      quarter_num == 4 ~ 10L,
+      TRUE ~ NA_integer_
+    ),
+    date = as.Date(sprintf("%04d-%02d-01", year, month))
+  ) %>%
+  arrange(date)
+
+# 1.8 Restrict to columns we actually use downstream
+df_full <- df %>%
+  select(date, date_q, year, quart,
+         adjusted_ebit, adjusted_ebit_marge, adjusted_ebitda,
+         total_revenue,
+         fuel, staff_cost, fees_charges,
+         operating_lease_charter, other_material_cost,
+         covid_dummy)
+
+# Quick sanity check
+str(df_full)
+
+
+#############################################
+# 2. Build core time series objects
+#    (main comparison metric: Adjusted EBIT Margin)
+#############################################
+
+# Use Adjusted EBIT margin as the main target for model comparison
+target_col <- "adjusted_ebit_marge"
+
+y_all <- df_full[[target_col]]
+
+start_year    <- year(min(df_full$date))
+start_quarter <- quarter(min(df_full$date))
+
+ts_all <- ts(y_all,
+             frequency = 4,
+             start     = c(start_year, start_quarter))
+
+n_all <- length(ts_all)
+
+# Contemporaneous exogenous regressors for ARIMAX
+xreg_vars <- c("fuel","staff_cost","fees_charges",
+               "operating_lease_charter","other_material_cost","covid_dummy")
+xreg_all <- as.matrix(df_full[, xreg_vars])
+
+# 1-quarter lagged exogenous regressors for lagged ARIMAX
+lag_vars <- c("fuel","staff_cost","fees_charges",
+              "operating_lease_charter","other_material_cost")
+
+df_lag <- df_full %>%
+  arrange(date) %>%
+  mutate(across(all_of(lag_vars),
+                ~ dplyr::lag(., 1),
+                .names = "{.col}_lag1"))
+
+# Replace NA from first lag row(s) with 0 (or another reasonable assumption)
+df_lag <- df_lag %>%
+  mutate(across(ends_with("_lag1"), ~ ifelse(is.na(.), 0, .)))
+
+xreg_lag_all <- as.matrix(df_lag %>%
+                            select(ends_with("_lag1"), covid_dummy))
+
+
+#############################################
+# 3. Compare forecast accuracy of three models
+#    on a common 4-quarter holdout set
+#############################################
+
+h_val <- 4   # 4-quarter holdout
+
+## 3.1 Model 1: Post-COVID ARIMA (only 2022+ data, no exogenous vars)
+
+df_post <- df_full %>%
+  filter(year >= 2022) %>%
+  arrange(date)
+
+# ---- FIX: handle missing target values to avoid NA metrics
+# keep quarterly continuity and fill gaps in the target via linear interpolation
+df_post[[target_col]] <- na.approx(df_post[[target_col]], rule = 2)
+
+ts_post <- ts(df_post[[target_col]],
+              frequency = 4,
+              start     = c(min(df_post$year),
+                            quarter(min(df_post$date))))
+
+len_post       <- length(ts_post)
+train_len_post <- len_post - h_val
+if (train_len_post <= 0) {
+  stop("Not enough post-COVID observations for a 4-quarter holdout.")
+}
+
+ts_post_train <- window(ts_post, end   = time(ts_post)[train_len_post])
+ts_post_val   <- window(ts_post, start = time(ts_post)[train_len_post + 1])
+
+# Fit ARIMA on post-COVID training window
+fit_m1_post_arima <- auto.arima(ts_post_train,
+                                seasonal      = TRUE,
+                                stepwise      = FALSE,
+                                approximation = FALSE)
+
+fc_m1_val <- forecast(fit_m1_post_arima, h = h_val)
+
+pred_m1   <- as.numeric(fc_m1_val$mean)
+actual_m1 <- as.numeric(ts_post_val)
+
+
+## 3.2 Model 2: ARIMAX with contemporaneous regressors
+##     (train on full sample except last 4 quarters)
+
+train_len <- n_all - h_val
+if (train_len <= 0) {
+  stop("Series too short for a 4-quarter holdout.")
+}
+
+ts_train <- window(ts_all, end   = time(ts_all)[train_len])
+ts_val   <- window(ts_all, start = time(ts_all)[train_len + 1])
+
+xreg_train <- xreg_all[1:train_len, , drop = FALSE]
+xreg_val   <- xreg_all[(train_len + 1):n_all, , drop = FALSE]
+
+fit_m2_arimax <- auto.arima(ts_train,
+                            xreg          = xreg_train,
+                            seasonal      = TRUE,
+                            stepwise      = FALSE,
+                            approximation = FALSE)
+
+fc_m2_val <- forecast(fit_m2_arimax,
+                      xreg = xreg_val,
+                      h    = h_val)
+
+pred_m2   <- as.numeric(fc_m2_val$mean)
+actual_m2 <- as.numeric(ts_val)
+
+
+## 3.3 Model 3: ARIMAX with 1-quarter lagged regressors
+##     (same train/holdout split as Model 2)
+
+xreg_lag_train <- xreg_lag_all[1:train_len, , drop = FALSE]
+xreg_lag_val   <- xreg_lag_all[(train_len + 1):n_all, , drop = FALSE]
+
+fit_m3_arimax_lag <- auto.arima(ts_train,
+                                xreg          = xreg_lag_train,
+                                seasonal      = TRUE,
+                                stepwise      = FALSE,
+                                approximation = FALSE)
+
+fc_m3_val <- forecast(fit_m3_arimax_lag,
+                      xreg = xreg_lag_val,
+                      h    = h_val)
+
+pred_m3   <- as.numeric(fc_m3_val$mean)
+actual_m3 <- as.numeric(ts_val)    # same holdout as model 2
+
+
+#############################################
+# 3.4 Explicitly compute & print RMSE / MAE
+#     (NA-safe using complete cases)
+#############################################
+
+# Safety check: lengths should match
+stopifnot(length(pred_m1) == length(actual_m1),
+          length(pred_m2) == length(actual_m2),
+          length(pred_m3) == length(actual_m3))
+
+# NA-safe indices
+idx1 <- complete.cases(actual_m1, pred_m1)
+idx2 <- complete.cases(actual_m2, pred_m2)
+idx3 <- complete.cases(actual_m3, pred_m3)
+
+# Compute metrics on complete pairs only
+rmse_m1 <- rmse(actual_m1[idx1], pred_m1[idx1])
+mae_m1  <- mae(actual_m1[idx1], pred_m1[idx1])
+
+rmse_m2 <- rmse(actual_m2[idx2], pred_m2[idx2])
+mae_m2  <- mae(actual_m2[idx2], pred_m2[idx2])
+
+rmse_m3 <- rmse(actual_m3[idx3], pred_m3[idx3])
+mae_m3  <- mae(actual_m3[idx3], pred_m3[idx3])
+
+cat("\n================ Model Validation (Holdout 4 Quarters) ================\n")
+
+cat("\nModel 1: Post-COVID ARIMA (2022+ only)\n")
+cat("Used", sum(idx1), "of", length(idx1), "holdout points after dropping NA pairs.\n")
+cat("RMSE:", round(rmse_m1, 4), "\n")
+cat("MAE :", round(mae_m1, 4), "\n")
+
+cat("\nModel 2: ARIMAX (contemporaneous xreg)\n")
+cat("Used", sum(idx2), "of", length(idx2), "holdout points after dropping NA pairs.\n")
+cat("RMSE:", round(rmse_m2, 4), "\n")
+cat("MAE :", round(mae_m2, 4), "\n")
+
+cat("\nModel 3: ARIMAX (1-quarter lagged xreg)\n")
+cat("Used", sum(idx3), "of", length(idx3), "holdout points after dropping NA pairs.\n")
+cat("RMSE:", round(rmse_m3, 4), "\n")
+cat("MAE :", round(mae_m3, 4), "\n")
+
+# Comparison table
+acc_table <- data.frame(
+  Model = c("M1_PostCOVID_ARIMA",
+            "M2_ARIMAX_Contemp",
+            "M3_ARIMAX_Lag1"),
+  RMSE  = c(rmse_m1, rmse_m2, rmse_m3),
+  MAE   = c(mae_m1,  mae_m2,  mae_m3),
+  Used_Holdout_Points = c(sum(idx1), sum(idx2), sum(idx3))
+)
+
+cat("\n---------------- Accuracy Summary ----------------\n")
+print(acc_table)
+
+best_model_rmse <- acc_table$Model[which.min(acc_table$RMSE)]
+best_model_mae  <- acc_table$Model[which.min(acc_table$MAE)]
+
+cat("\nBest model by RMSE:", best_model_rmse, "\n")
+cat("Best model by MAE :", best_model_mae,  "\n")
+cat("===============================================================\n")
+
+
+#############################################
+# 4. Final forecasting to 2030 Q4
+#    Using lagged ARIMAX for Adjusted EBIT & Total Revenue
+#############################################
+
+# 4.0 Rebuild lagged exogenous matrix if needed
+lag_vars <- c("fuel","staff_cost","fees_charges",
+              "operating_lease_charter","other_material_cost")
+
+df_lag <- df_full %>%
+  arrange(date) %>%
+  mutate(across(all_of(lag_vars),
+                ~ dplyr::lag(., 1),
+                .names = "{.col}_lag1")) %>%
+  mutate(across(ends_with("_lag1"), ~ ifelse(is.na(.), 0, .)))
+
+xreg_lag_all <- as.matrix(df_lag %>%
+                            select(ends_with("_lag1"), covid_dummy))
+
+# 4.1 Time series for Adjusted EBIT and Total Revenue
+start_year    <- year(min(df_lag$date))
+start_quarter <- quarter(min(df_lag$date))
+
+ts_ebit <- ts(df_lag$adjusted_ebit,
+              frequency = 4,
+              start     = c(start_year, start_quarter))
+
+ts_revenue <- ts(df_lag$total_revenue,
+                 frequency = 4,
+                 start     = c(start_year, start_quarter))
+
+xreg_lag_final <- xreg_lag_all
+
+# 4.2 Compute forecast horizon to 2030 Q4
+last_date    <- max(df_lag$date, na.rm = TRUE)
+last_year    <- year(last_date)
+last_quarter <- quarter(last_date)
+
+h_2030 <- (2030 - last_year) * 4 + (4 - last_quarter)
+if (h_2030 <= 0) {
+  stop("Data already extends beyond 2030 Q4, please adjust h_2030.")
+}
+
+# 4.3 Build exogenous matrix for future horizon
+#     We assume the last observed lagged exogenous profile persists.
+xreg_lag_future <- matrix(
+  rep(tail(xreg_lag_final, 1), h_2030),
+  nrow = h_2030,
+  byrow = TRUE
+)
+colnames(xreg_lag_future) <- colnames(xreg_lag_final)
+
+# 4.4 Fit lagged ARIMAX for EBIT & Revenue and forecast to 2030 Q4
+
+fit_ebit_final <- auto.arima(ts_ebit,
+                             xreg          = xreg_lag_final,
+                             seasonal      = TRUE,
+                             stepwise      = FALSE,
+                             approximation = FALSE)
+
+fit_revenue_final <- auto.arima(ts_revenue,
+                                xreg          = xreg_lag_final,
+                                seasonal      = TRUE,
+                                stepwise      = FALSE,
+                                approximation = FALSE)
+
+fc_ebit_2030 <- forecast(fit_ebit_final,
+                         xreg = xreg_lag_future,
+                         h    = h_2030)
+
+fc_revenue_2030 <- forecast(fit_revenue_final,
+                            xreg = xreg_lag_future,
+                            h    = h_2030)
+
+
+#############################################
+# 5. Construct Adjusted EBIT Margin (2012–2030)
+#    Margin = Adjusted EBIT / Total Revenue
+#############################################
+
+# 5.1 Actual margin (in %)
+# If Total Revenue can be zero, we protect division by zero
+margin_actual_pct <- 100 * (df_lag$adjusted_ebit / df_lag$total_revenue)
+
+# Time index for actual series
+time_ebit   <- time(ts_ebit)
+date_q_act  <- as.yearqtr(time_ebit)
+date_act    <- as.Date(date_q_act)
+
+margin_act_df <- data.frame(
+  date       = date_act,
+  date_q     = date_q_act,
+  margin_pct = as.numeric(margin_actual_pct),
+  type       = "Actual"
+)
+
+# 5.2 Forecast margin from latest quarter to 2030 Q4
+
+# Use the same horizon as the forecast objects
+h_2030 <- length(fc_ebit_2030$mean)  # safer than reusing an old variable
+
+last_time_num <- as.numeric(tail(time_ebit, 1))  # convert to numeric
+
+fc_times <- seq(from = last_time_num + 0.25,
+                by   = 0.25,
+                length.out = h_2030)
+
+date_q_fc <- as.yearqtr(fc_times)
+date_fc   <- as.Date(date_q_fc)
+
+# Compute forecast margin = EBIT_forecast / Revenue_forecast (in %)
+margin_forecast_pct <- 100 * (
+  as.numeric(fc_ebit_2030$mean) /
+    as.numeric(fc_revenue_2030$mean)
+)
+
+margin_fc_df <- data.frame(
+  date       = date_fc,
+  date_q     = date_q_fc,
+  margin_pct = margin_forecast_pct,
+  type       = "Forecast"
+)
+
+# 5.3 Combine actual + forecast margin
+margin_df <- rbind(margin_act_df, margin_fc_df) %>%
+  arrange(date)
+
+# Quick check: last few rows should be near 2030 Q4
+tail(margin_df, 8)
+
+
+#############################################
+# 6. Plot Adjusted EBIT Margin 2012–2030
+#############################################
+margin_df_222030 <- margin_df %>%
+  filter(
+    date >= as.Date(as.yearqtr("2022 Q1")),
+    date <= as.Date(as.yearqtr("2030 Q4"))
+  )
+
+# Target range 8–10%
+target_center <- 9
+target_min    <- 8
+target_max    <- 10
+
+target_date_line  <- as.Date(as.yearqtr("2030 Q4"))
+target_label_date <- as.Date(as.yearqtr("2029 Q2"))
+
+# Key Years (Values marked only for these years)
+key_years <- c(2022, 2025, 2030)
+
+margin_key_points <- margin_df_222030 %>%
+  mutate(year = as.integer(format(date, "%Y"))) %>%
+  filter(year %in% key_years) %>%
+  group_by(type, year) %>%
+  slice_max(order_by = date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    label   = sprintf("%.1f%%", margin_pct),
+    # Vertical offset: positive values shift upwards, negative values shift downwards
+    label_y = margin_pct + ifelse(margin_pct >= 0, 0.8, -0.8),
+    # Horizontal shift: uniformly move 30 days to the right
+    label_x = date - 45
+  )
+
+
+ggplot(margin_df_222030,
+       aes(x = date, y = margin_pct, colour = type, linetype = type)) +
+  # A more clearly defined target band
+  annotate("rect",
+           xmin = as.Date(as.yearqtr("2029 Q1")),
+           xmax = as.Date(as.yearqtr("2030 Q4")),
+           ymin = target_min,
+           ymax = target_max,
+           alpha = 0.25,
+           fill  = "skyblue") +
+  # Central target line 9%
+  geom_hline(
+    yintercept = target_center,
+    linetype   = "dotted",
+    colour     = "blue"
+  ) +
+  # 2030Q4 Target Point
+  annotate("point",
+           x = target_date_line,
+           y = target_center,
+           colour = "blue", size = 2) +
+
+  annotate("text",
+           x     = target_label_date,
+           y     = target_max,
+           label = "2030 target: 8–10% Adjusted EBIT margin",
+           hjust = 0, vjust = -0.5,
+           colour = "blue", size = 3) +
+
+  geom_line(size = 1) +
+
+  geom_text(
+    data = margin_key_points,
+    aes(x = label_x, y = label_y, label = label, colour = type),
+    inherit.aes = FALSE,
+    size        = 4,
+    vjust       = 0.5,
+    show.legend = FALSE
+  ) +
+  
+  scale_colour_manual(values = c("Actual" = "black", "Forecast" = "red")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Forecast" = "dashed")) +
+  scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y",
+    limits = c(as.Date(as.yearqtr("2022 Q1")),
+               as.Date(as.yearqtr("2030 Q4"))),
+    expand = expansion(mult = c(0.01, 0.12))
+  ) +
+  labs(
+    title    = "Lufthansa Group: Adjusted EBIT Margin (2022–2030)",
+    x        = "Year",
+    y        = "Adjusted EBIT Margin (%)",
+    colour   = "",
+    linetype = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+#############################################
+# 7. Build tidy dataframe for plotting & export
+#    (Actual + Forecast to 2030 Q4)
+#############################################
+
+ts_list <- list(
+  "Adjusted EBIT"        = ts_ebit,
+  "Total Revenue"        = ts_revenue
+)
+
+forecast_list <- list(
+  "Adjusted EBIT"        = fc_ebit_2030,
+  "Total Revenue"        = fc_revenue_2030
+)
+
+plot_df <- lapply(names(ts_list), function(name) {
+  ts_metric <- ts_list[[name]]
+  fc        <- forecast_list[[name]]
+  
+  # Actual data
+  time_index      <- time(ts_metric)
+  date_q_actual   <- as.yearqtr(time_index)
+  date_actual     <- as.Date(date_q_actual)   # first day of quarter
+  df_actual <- data.frame(
+    date   = date_actual,
+    date_q = date_q_actual,
+    value  = as.numeric(ts_metric),
+    type   = "Actual",
+    metric = name
+  )
+  
+  # Forecast data
+  last_time   <- time_index[length(time_index)]
+  fc_times    <- seq(from = last_time + 0.25, by = 0.25, length.out = length(fc$mean))
+  date_q_fc   <- as.yearqtr(fc_times)
+  date_fc     <- as.Date(date_q_fc)
+  
+  df_forecast <- data.frame(
+    date   = date_fc,
+    date_q = date_q_fc,
+    value  = as.numeric(fc$mean),
+    type   = "Forecast",
+    metric = name
+  )
+  
+  rbind(df_actual, df_forecast)
+}) %>% bind_rows()
+
+# Ensure we really go to 2030 Q4
+print(max(plot_df$date_q))
+
+
+#############################################
+# 8. Plot: Actual vs Forecast to 2030 Q4
+#    with 2030 target band (8–10% Adjusted EBIT margin)
+#############################################
+library(grid)  
+
+
+plot_df2 <- plot_df %>% 
+  filter(metric %in% c("Adjusted EBIT", "Total Revenue"))
+
+
+end_points <- plot_df2 %>% 
+  group_by(metric, type) %>% 
+  filter(date == max(date)) %>% 
+  ungroup() %>% 
+  mutate(
+    label = paste0(
+      format(date, "%Y"), "  ",
+      format(round(value, 0), big.mark = ",")
+    )
+  )
+
+
+key_years <- c("2019", "2020", "2025", "2030")
+
+key_points <- plot_df2 %>% 
+  filter(
+    format(date, "%Y") %in% key_years,
+    format(date, "%m") == "12",  
+    type == "Actual"
+  ) %>% 
+  group_by(metric, date) %>% 
+  summarise(value = last(value), .groups = "drop") %>% 
+  mutate(
+    label = paste0(
+      format(date, "%Y"), "\n",
+      format(round(value, 0), big.mark = ",")
+    )
+  )
+
+ggplot(plot_df2, aes(x = date, y = value, colour = type, linetype = type)) +
+  geom_line(size = 1) +
+  
+  geom_label(
+    data = end_points,
+    aes(label = label),
+    size = 3,
+    label.padding = unit(0.15, "lines"),
+    label.size = 0.2,
+    show.legend = FALSE,
+    hjust = 0,        
+    vjust = 0.5
+  ) +
+  
+
+  geom_label(
+    data = key_points,
+    aes(x = date, y = value, label = label),
+    inherit.aes = FALSE,
+    size = 3,
+    label.padding = unit(0.15, "lines"),
+    label.size = 0.2,
+    show.legend = FALSE,
+    vjust = -0.2
+  ) +
+  
+  facet_wrap(~ metric, scales = "free_y", ncol = 1) +  
+  scale_colour_manual(values = c("Actual" = "black", "Forecast" = "red")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Forecast" = "dashed")) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = expansion(mult = c(0.01, 0.15))  
+  ) +
+  labs(
+    title    = "Lufthansa Group: Actual vs Forecasts to 2030 Q4",
+    x        = "Year",
+    y        = "Value",
+    colour   = "",
+    linetype = ""
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+#############################################
+# 9. Export results to Excel (to 2030 Q4)
+#############################################
+
+# Single sheet with all metrics
+write.xlsx(plot_df,
+           "D:/Module/BU7155 mining/groupwork/LHGroup_Forecasts_to2030.xlsx",
+           sheetName = "Forecasts",
+           rowNames  = FALSE)
+
+# Workbook with one sheet per metric
+wb <- createWorkbook()
+for (m in unique(plot_df$metric)) {
+  addWorksheet(wb, m)
+  writeData(wb, m, plot_df %>% filter(metric == m))
+}
+
+saveWorkbook(wb,
+             "D:/Module/BU7155 mining/groupwork/LHGroup_Forecasts_ByMetric_to2030.xlsx",
+             overwrite = TRUE)
+
+
+
+## Forecast for business segments
+#############################################
+# Step 0. Libraries and helper functions
+#############################################
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(zoo)
+library(forecast)
+library(ggplot2)
+library(Metrics)
+library(openxlsx)
+
+clean_num <- function(x) {
+  x <- gsub("\\(|\\)", "-", x)      
+  x <- gsub("[^0-9.\\-]", "", x)   
+  as.numeric(ifelse(x == "", NA, x))
+}
+
+#############################################
+# Step 1. Load & clean data (2016+ only)
+#############################################
+
+file <- "D:/Module/BU7155 mining/groupwork/quarterly_business_segment.xlsx"
+df_raw <- read_excel(file, sheet = "business_segment", col_types = "text")
+
+df <- df_raw %>%
+  rename_all(~ tolower(gsub("\\s+", "_", .))) %>%
+  mutate(
+    year    = as.integer(year),
+    quarter = toupper(trimws(quarter)),
+    quarter_num = case_when(
+      quarter %in% c("Q1", "1") ~ 1L,
+      quarter %in% c("Q2", "2") ~ 2L,
+      quarter %in% c("Q3", "3") ~ 3L,
+      quarter %in% c("Q4", "4") ~ 4L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  mutate(
+    date_q = as.yearqtr(paste(year, quarter_num), format = "%Y %q"),
+    month  = case_when(
+      quarter_num == 1 ~ 1L,
+      quarter_num == 2 ~ 4L,
+      quarter_num == 3 ~ 7L,
+      quarter_num == 4 ~ 10L,
+      TRUE ~ NA_integer_
+    ),
+    date = as.Date(sprintf("%04d-%02d-01", year, month))
+  )
+
+# Convert numeric columns
+num_cols <- c("covid_dummy","adjusted_ebit","adjusted_ebit_marge",
+              "total_revenue","fuel","fees_charges","operating_lease_charter",
+              "other_material_cost","staff_cost")
+
+df <- df %>%
+  mutate(across(all_of(num_cols), ~ clean_num(.))) %>%
+  arrange(business_segment, date)
+
+# Filter for 2016 and relevant segments
+segments <- c("network_airlines","eurowings","logistic","mro","other")
+
+df_2016 <- df_2016 %>%
+  mutate(business_segment = tolower(trimws(business_segment)))
+
+segments <- tolower(segments)
+
+# Quick checks
+table(df_2016$business_segment)
+range(df_2016$date)
+
+#############################################
+# Step 2 (MODIFIED). 
+# lagged ARIMAX forecast for one segment
+#  - auto drop rank-deficient xreg columns
+#  - use forecast object's own time index (fix seq() length error)
+#############################################
+
+# Helper: make xreg full-rank inside each segment
+make_full_rank_xreg <- function(x, tol = 1e-7){
+  if (is.null(x) || ncol(x) == 0) return(x)
+  
+  # 1) Drop all-NA / constant columns (variance = 0)
+  keep <- apply(x, 2, function(col){
+    col2 <- col[!is.na(col)]
+    length(unique(col2)) > 1
+  })
+  x2 <- x[, keep, drop = FALSE]
+  
+  if (ncol(x2) <= 1) return(x2)
+  
+  # 2) Drop collinear columns using QR pivoting until full rank
+  repeat {
+    qr_obj <- qr(x2, tol = tol)
+    if (qr_obj$rank == ncol(x2)) break
+    
+    piv <- qr_obj$pivot
+    redundant <- piv[(qr_obj$rank + 1):ncol(x2)]
+    x2 <- x2[, -redundant[1], drop = FALSE]
+    
+    if (ncol(x2) <= 1) break
+  }
+  
+  return(x2)
+}
+
+forecast_one_segment <- function(df_seg, seg_name, end_year = 2030, end_quarter = 4) {
+  
+  message("---- Segment: ", seg_name, " ----")
+  
+  # 2.1 Complete quarters + LOCF for missing values
+  df_seg <- df_seg %>%
+    arrange(date) %>%
+    complete(date_q = seq(min(date_q), max(date_q), by = 0.25)) %>%
+    arrange(date_q) %>%
+    mutate(
+      date = as.Date(date_q),
+      year = as.integer(format(date, "%Y")),
+      quarter_num = quarter(date),
+      across(c(total_revenue, adjusted_ebit, fuel, staff_cost, fees_charges,
+               operating_lease_charter, other_material_cost, covid_dummy),
+             ~ zoo::na.locf(.x, na.rm = FALSE))
+    )
+  
+  # 2.2 Build 1-quarter lagged exogenous regressors
+  lag_vars <- c("fuel","staff_cost","fees_charges",
+                "operating_lease_charter","other_material_cost")
+  
+  df_lag <- df_seg %>%
+    mutate(across(all_of(lag_vars),
+                  ~ dplyr::lag(., 1),
+                  .names = "{.col}_lag1")) %>%
+    mutate(across(ends_with("_lag1"), ~ ifelse(is.na(.), 0, .)))
+  
+  xreg_lag_full <- as.matrix(df_lag %>% select(ends_with("_lag1"), covid_dummy))
+  
+  # --- FIX 1: drop rank-deficient columns within segment
+  xreg_lag <- make_full_rank_xreg(xreg_lag_full)
+  dropped_cols <- setdiff(colnames(xreg_lag_full), colnames(xreg_lag))
+  if (length(dropped_cols) > 0) {
+    message("Dropped xreg cols (rank deficient): ", paste(dropped_cols, collapse = ", "))
+  }
+  
+  # 2.3 Build ts objects
+  start_year    <- year(min(df_lag$date))
+  start_quarter <- quarter(min(df_lag$date))
+  
+  ts_ebit <- ts(df_lag$adjusted_ebit, frequency = 4,
+                start = c(start_year, start_quarter))
+  ts_rev  <- ts(df_lag$total_revenue, frequency = 4,
+                start = c(start_year, start_quarter))
+  
+  # 2.4 Forecast horizon to 2030 Q4
+  last_date    <- max(df_lag$date, na.rm = TRUE)
+  last_year    <- year(last_date)
+  last_quarter <- quarter(last_date)
+  
+  h_to_2030 <- (end_year - last_year) * 4 + (end_quarter - last_quarter)
+  if (h_to_2030 <= 0) stop(seg_name, ": data already beyond target horizon.")
+  
+  # 2.5 Future xreg: persist last observed lagged profile
+  if (!is.null(xreg_lag) && ncol(xreg_lag) > 0) {
+    xreg_future <- matrix(rep(tail(xreg_lag, 1), h_to_2030),
+                          nrow = h_to_2030, byrow = TRUE)
+    colnames(xreg_future) <- colnames(xreg_lag)
+  } else {
+    xreg_future <- NULL
+  }
+  
+  # 2.6 Fit + forecast
+  if (is.null(xreg_future)) {
+    # fall back to pure ARIMA if no usable xreg remains
+    fit_ebit <- auto.arima(ts_ebit, seasonal = TRUE,
+                           stepwise = FALSE, approximation = FALSE)
+    fit_rev  <- auto.arima(ts_rev,  seasonal = TRUE,
+                           stepwise = FALSE, approximation = FALSE)
+    
+    fc_ebit <- forecast(fit_ebit, h = h_to_2030)
+    fc_rev  <- forecast(fit_rev,  h = h_to_2030)
+    
+  } else {
+    fit_ebit <- auto.arima(ts_ebit, xreg = xreg_lag,
+                           seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+    fit_rev  <- auto.arima(ts_rev,  xreg = xreg_lag,
+                           seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+    
+    fc_ebit <- forecast(fit_ebit, xreg = xreg_future, h = h_to_2030)
+    fc_rev  <- forecast(fit_rev,  xreg = xreg_future, h = h_to_2030)
+  }
+  
+  # 2.7 Build tidy output
+  make_df <- function(ts_obj, fc_obj, metric_name){
+    
+    # Actual
+    time_act      <- time(ts_obj)
+    date_q_actual <- as.yearqtr(time_act)
+    date_actual   <- as.Date(date_q_actual)
+    
+    df_actual <- data.frame(
+      business_segment = seg_name,
+      date   = date_actual,
+      date_q = date_q_actual,
+      value  = as.numeric(ts_obj),
+      type   = "Actual",
+      metric = metric_name
+    )
+    
+    # --- FIX 2: use forecast object's own time index (avoid seq() errors)
+    time_fc   <- time(fc_obj$mean)
+    date_q_fc <- as.yearqtr(time_fc)
+    date_fc   <- as.Date(date_q_fc)
+    
+    df_fc <- data.frame(
+      business_segment = seg_name,
+      date   = date_fc,
+      date_q = date_q_fc,
+      value  = as.numeric(fc_obj$mean),
+      type   = "Forecast",
+      metric = metric_name
+    )
+    
+    rbind(df_actual, df_fc)
+  }
+  
+  out_df <- bind_rows(
+    make_df(ts_ebit, fc_ebit, "Adjusted EBIT"),
+    make_df(ts_rev,  fc_rev,  "Total Revenue")
+  )
+  
+  list(
+    segment  = seg_name,
+    fit_ebit = fit_ebit, fit_rev = fit_rev,
+    fc_ebit  = fc_ebit,  fc_rev  = fc_rev,
+    out_df   = out_df
+  )
+}
+
+
+#############################################
+# Step 3. Run forecasts for 5 segments
+#############################################
+
+results <- lapply(segments, function(seg){
+  df_seg <- df_2016 %>% filter(business_segment == seg)
+  forecast_one_segment(df_seg, seg_name = seg)
+})
+
+plot_df_all <- bind_rows(lapply(results, `[[`, "out_df"))
+plot_df_all %>%
+  group_by(business_segment, metric, type) %>%
+  summarise(max_q = max(date_q), .groups = "drop")
+
+#############################################
+# Step 4. Plot Actual vs Forecast by segment
+#############################################
+
+ggplot(plot_df_all, aes(x = date, y = value, colour = type, linetype = type)) +
+  geom_line(size = 0.9) +
+  facet_grid(metric ~ business_segment, scales = "free_y") +
+  scale_colour_manual(values = c("Actual" = "black", "Forecast" = "red")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Forecast" = "dashed")) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(
+    title = "Lufthansa Group by Business Segment: Actual vs Forecast (2016–2030 Q4)",
+    x = "Year", y = "Value", colour = "", linetype = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+#############################################
+# Step 5. Export to Excel
+#############################################
+
+write.xlsx(plot_df_all,
+           "LH_BusinessSegments_Forecasts_2016_to2030.xlsx",
+           sheetName = "AllSegments",
+           rowNames = FALSE)
+
+wb <- createWorkbook()
+for (seg in segments) {
+  addWorksheet(wb, seg)
+  writeData(wb, seg, plot_df_all %>% filter(business_segment == seg))
+}
+
+saveWorkbook(wb,
+             "LH_BusinessSegments_Forecasts_BySegment_2016_to2030.xlsx",
+             overwrite = TRUE)
+
